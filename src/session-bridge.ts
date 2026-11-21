@@ -2,6 +2,7 @@ import type {
   LanguageModelV3,
   LanguageModelV3CallOptions,
   LanguageModelV3FinishReason,
+  LanguageModelV3Prompt,
   LanguageModelV3StreamPart,
   LanguageModelV3Usage,
 } from "@ai-sdk/provider"
@@ -20,6 +21,7 @@ import {
   type AcpProcessOptions,
   type AcpPromptResult,
   type AcpSessionUpdate,
+  type AcpContentBlock,
 } from "./acp-client.js"
 import {
   ACP_PROVIDER_ID,
@@ -155,6 +157,18 @@ interface BridgeSession {
   settlingPrompt?: Promise<void>
   /** Foreground reservations held by live doStream turns (excluded from idle LRU). */
   foregroundCount?: number
+  /**
+   * Antigravity `ask_question` call that was re-routed to OpenCode's local
+   * interactive `question` tool. When the matching tool result comes back in
+   * the next doStream prompt, it is forwarded to agy as a plain-text answer
+   * prompt (the same way the Antigravity CLI itself delivers answers).
+   */
+  pendingQuestion?: PendingQuestion
+}
+
+interface PendingQuestion {
+  readonly callId: string
+  readonly questions: ReadonlyArray<{ readonly question: string }>
 }
 
 interface WarmSpare {
@@ -241,15 +255,24 @@ function catalogSignature(models: readonly AcpDiscoveredModel[]): string {
   return JSON.stringify(models.map((m) => [m.id, m.name, m.family, m.defaultAcpModelId, m.variants]))
 }
 
+// Antigravity `session/prompt` usage semantics (verified against agy 1.5.14):
+//   inputTokens       = NEW (non-cached) input tokens for the turn
+//   cachedReadTokens  = cached portion of the input
+//   cachedWriteTokens = cache-write portion of the input
+//   outputTokens      = output text + thought tokens
+//   thoughtTokens     = reasoning portion of the output
+//   totalTokens       = inputTokens + cachedRead + output (matches usage_update.used)
+// OpenCode derives the displayed per-message "input" from inputTokens.noCache,
+// so subtracting the cached portions here (as upstream did) zeroed the display.
 function zeroUsage(raw?: AcpPromptResult["usage"]): LanguageModelV3Usage {
-  const inputTotal = raw?.inputTokens
+  const noCache = raw?.inputTokens
   const cacheRead = raw?.cachedReadTokens
   const cacheWrite = raw?.cachedWriteTokens
   const outputTotal = raw?.outputTokens
   const reasoning = raw?.thoughtTokens
-  const noCache =
-    inputTotal !== undefined
-      ? Math.max(0, inputTotal - (cacheRead ?? 0) - (cacheWrite ?? 0))
+  const inputTotal =
+    noCache !== undefined || cacheRead !== undefined || cacheWrite !== undefined
+      ? (noCache ?? 0) + (cacheRead ?? 0) + (cacheWrite ?? 0)
       : undefined
   const text =
     outputTotal !== undefined ? Math.max(0, outputTotal - (reasoning ?? 0)) : undefined
@@ -278,6 +301,105 @@ function sanitizeMcpToolName(name: string, used: Set<string>): string {
   }
   used.add(candidate)
   return candidate
+}
+
+/**
+ * Translates Antigravity's native `ask_question` input
+ * ({ questions: [{ question, options: string[], is_multi_select }] }) into
+ * OpenCode's local `question` tool input
+ * ({ questions: [{ question, header, options: [{ label, description }], multiple }] }).
+ * Returns undefined when the shape is not recognized; the caller then falls
+ * back to the generic provider-executed rendering.
+ */
+function translateAskQuestionInput(
+  raw: unknown,
+): { input: Record<string, unknown>; questions: ReadonlyArray<{ question: string }> } | undefined {
+  if (!raw || typeof raw !== "object") return undefined
+  const list = (raw as Record<string, unknown>).questions
+  if (!Array.isArray(list) || list.length === 0) return undefined
+  const out: Record<string, unknown>[] = []
+  const originals: { question: string }[] = []
+  for (const entry of list) {
+    if (!entry || typeof entry !== "object") return undefined
+    const q = entry as Record<string, unknown>
+    const question = String(q.question ?? "").trim()
+    if (!question) return undefined
+    const rawOptions = Array.isArray(q.options) ? q.options : []
+    const options = rawOptions.map((o) => ({
+      label: String(o),
+      description: "",
+    }))
+    const header = question.length > 24 ? `${question.slice(0, 24).trimEnd()}…` : question
+    originals.push({ question })
+    out.push({
+      question,
+      header,
+      options,
+      multiple: q.is_multi_select === true || q.multiple === true,
+    })
+  }
+  return { input: { questions: out }, questions: originals }
+}
+
+/**
+ * Finds the tool result for a re-routed ask_question call in the next prompt
+ * and formats it as a plain-text answer for agy. agy ended its turn when it
+ * asked, so the answer travels as the next user prompt. Returns a dismissal
+ * note when the user cancelled, and undefined when no matching result exists
+ * (e.g. the user typed a normal message instead).
+ */
+function buildQuestionAnswerBlocks(
+  pending: PendingQuestion,
+  prompt: LanguageModelV3Prompt,
+): AcpContentBlock[] | undefined {
+  for (let i = prompt.length - 1; i >= 0; i--) {
+    const msg = prompt[i]
+    if (msg.role !== "tool" || !Array.isArray(msg.content)) continue
+    for (const part of msg.content as ReadonlyArray<any>) {
+      if (part?.type !== "tool-result" || part.toolCallId !== pending.callId) continue
+      const answers = extractQuestionAnswers(part.output)
+      if (!answers) {
+        return [
+          {
+            type: "text",
+            text: "(The user dismissed the question without answering. Proceed with your recommended option(s).)",
+          },
+        ]
+      }
+      const lines: string[] = ["The user answered your question(s):"]
+      for (let n = 0; n < pending.questions.length; n++) {
+        const q = pending.questions[n]?.question ?? `Question ${n + 1}`
+        const a = answers[n] && answers[n].length > 0 ? answers[n].join(", ") : "(no answer)"
+        lines.push(`Q${n + 1}: ${q}`)
+        lines.push(`A${n + 1}: ${a}`)
+      }
+      return [{ type: "text", text: lines.join("\n") }]
+    }
+  }
+  return undefined
+}
+
+/** OpenCode's question tool returns { answers: string[][] } as its output. */
+function extractQuestionAnswers(output: unknown): string[][] | undefined {
+  let value: unknown
+  if (output && typeof output === "object") {
+    const o = output as Record<string, unknown>
+    if (o.type === "json") value = o.value
+    else if (o.type === "text" && typeof o.value === "string") {
+      try {
+        value = JSON.parse(o.value)
+      } catch {
+        return undefined
+      }
+    } else if (Array.isArray((o as any).answers)) {
+      value = o
+    }
+  }
+  const answers = (value as any)?.answers
+  if (!Array.isArray(answers)) return undefined
+  return answers.map((a: unknown) =>
+    Array.isArray(a) ? a.map(String) : a === null || a === undefined ? [] : [String(a)],
+  )
 }
 
 function buildDescriptors(
@@ -1745,6 +1867,63 @@ export class SessionBridgeManager {
         return
       }
 
+      // Antigravity's native ask_question has no resolver over ACP: agy emits
+      // tool_call(in_progress) -> tool_call_update(pending), ends its turn and
+      // expects the answer as the next user prompt. As a provider-executed
+      // acp_* part it just hangs until aborted. Re-route it to OpenCode's
+      // local interactive `question` tool instead: emit a client-executed tool
+      // call, finish the step with tool-calls, and let OpenCode collect the
+      // answer. buildQuestionAnswerBlocks forwards it on the next turn.
+      if (name === "ask_question") {
+        if (kind === "tool_call" && !s.pendingQuestion) {
+          const translated = translateAskQuestionInput(update.rawInput ?? update.args ?? {})
+          if (translated) {
+            s.pendingQuestion = { callId, questions: translated.questions }
+            turn.relayedUpdateIds.add(callId) // swallow the pending update too
+            this.closeOpenBlocks(turn)
+            const jsonInput = JSON.stringify(translated.input)
+            this.emitPart(turn, {
+              type: "tool-input-start",
+              id: callId,
+              toolName: "question",
+              providerExecuted: false,
+            })
+            this.emitPart(turn, {
+              type: "tool-input-delta",
+              id: callId,
+              delta: jsonInput,
+            })
+            this.emitPart(turn, {
+              type: "tool-input-end",
+              id: callId,
+            })
+            this.emitPart(turn, {
+              type: "tool-call",
+              toolCallId: callId,
+              toolName: "question",
+              input: jsonInput,
+              providerExecuted: false,
+              providerMetadata: { [ACP_PROVIDER_ID]: { acp: true } },
+            })
+            this.emitPart(turn, {
+              type: "finish",
+              finishReason: { unified: "tool-calls", raw: "tool_calls" },
+              usage: zeroUsage(),
+              providerMetadata: { [ACP_PROVIDER_ID]: { acp: true } },
+            })
+            const ctrl = this.detachController(turn)
+            try {
+              ctrl?.close()
+            } catch {}
+            this.notifyChanged(s.sessionID)
+            return
+          }
+        } else if (s.pendingQuestion?.callId === callId) {
+          turn.relayedUpdateIds.add(callId)
+          return
+        }
+      }
+
       const status = String(update.status ?? "")
       if (kind === "tool_call" && !turn.activeNativeTools.has(callId)) {
         this.closeOpenBlocks(turn)
@@ -2182,10 +2361,20 @@ export class SessionBridgeManager {
           // now that the first real turn consumed the handoff flag.
           await bridge.runStorageSet(sessionID, acpSessionId)
         }
+        // Question-answer turn: the previous step re-routed an agy
+        // ask_question to OpenCode's local question tool, and this prompt
+        // carries its tool result. Forward the answer as plain text instead
+        // of the generic thin prompt (which would resend the last user text).
+        const pendingQuestion = s.pendingQuestion
+        s.pendingQuestion = undefined
+        const answerBlocks = pendingQuestion
+          ? buildQuestionAnswerBlocks(pendingQuestion, options.prompt)
+          : undefined
         const promptBlocks =
-          needsHandoff || (hadFreshStart && nonSystemTurnCount > 1)
+          answerBlocks ??
+          (needsHandoff || (hadFreshStart && nonSystemTurnCount > 1)
             ? buildTextOnlyHandoffPromptBlocks(options.prompt, { maxChars: 16_000 })
-            : buildThinAcpPromptBlocks(options.prompt)
+            : buildThinAcpPromptBlocks(options.prompt))
 
         const turn: ActiveTurn = {
           bufferedParts: [],
