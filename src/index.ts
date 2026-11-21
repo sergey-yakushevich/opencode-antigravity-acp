@@ -101,10 +101,18 @@ export default Plugin.define({
         { providerID: ACP_PROVIDER_ID as any },
       )
 
-      // Strict Thin ACP Mode: zero outer-harness prompt/tool injection.
+      // Strict Thin ACP Mode: zero outer-harness prompt injection.
       // Snapshot the live tool catalog for the optional Code Mode MCP relay,
-      // then clear outer system instructions AND tool schemas so OpenCode
-      // does not inject anything into the ACP model call.
+      // then clear outer system instructions so OpenCode does not inject
+      // anything into the ACP model call.
+      //
+      // NOTE: input.tools is intentionally NOT cleared. The bridge never
+      // forwards options.tools to agy (prompts are thin text-only), so no
+      // tool schemas reach the ACP side either way — but OpenCode resolves
+      // client-executed tool calls (MCP relay callbacks, the re-routed local
+      // `question` tool) against the request's tool definitions and fails
+      // them with "Tool is not available for this request" when the map is
+      // empty. Keeping the map local-only preserves thin mode and execution.
       yield* ctx.session.hook("context", (input) =>
         Effect.sync(() => {
           if (input.model.providerID === ACP_PROVIDER_ID) {
@@ -115,7 +123,6 @@ export default Plugin.define({
               tools: input.tools,
             })
             input.system = []
-            input.tools = {}
           } else {
             sanitizeForNonAcpModel(input.messages as any[])
           }
